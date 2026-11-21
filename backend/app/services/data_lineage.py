@@ -104,9 +104,137 @@ class DataLineageService(BaseModuleService):
             **adj,
         }
 
+    # ---- 版本化字段血缘（消费语义层映射修订数据） ----
+
+    def build_versioned_field_graph(self, revision_id: int) -> LineageGraph:
+        """按映射修订版次构建字段级血缘图。
+
+        仅纳入已确认血缘边；未确认边不会进入图（确认版次之前不把新字段写入关系）。
+        """
+        from app.mapping_store import mapping_store
+
+        graph = LineageGraph()
+        revision = mapping_store.get_revision(revision_id)
+        if revision is None:
+            return graph
+        adjacency: dict[str, dict[str, Any]] = {}
+        for edge in mapping_store.edges_for(revision_id):
+            if not edge.confirmed:
+                continue
+            source = edge.source_node
+            target = edge.target_node
+            adjacency.setdefault(source, {"upstream": [], "downstream": set()})
+            adjacency.setdefault(target, {"upstream": set(), "downstream": set()})
+            adjacency[source]["downstream"].add(target)
+            adjacency[target]["upstream"].add(source)
+        for node_id, links in adjacency.items():
+            graph.add_node(LineageNode(
+                node_id=node_id, node_name=node_id, node_type="field-lineage",
+                upstream_ids=sorted(links["upstream"]),
+                downstream_ids=sorted(links["downstream"]),
+            ))
+        return graph
+
+    def read_lineage_version(
+        self, semantic_id: int, version_tag: str | None = None,
+    ) -> dict[str, Any]:
+        """血缘接口读取版次数据：不传版次读当前已发布，传版次读指定历史版次。
+
+        返回明确的 readable 标记与未确认边清单，便于调用方核对「究竟能读取哪一版」。
+        """
+        from app.mapping_store import REV_PUBLISHED, mapping_store
+
+        revision = (
+            mapping_store.get_revision_by_tag(semantic_id, version_tag)
+            if version_tag else mapping_store.published_revision(semantic_id)
+        )
+        if revision is None:
+            return {
+                "ok": False, "readable": False,
+                "message": f"语义 {semantic_id} 不存在版次 {version_tag or '已发布'} 的血缘数据",
+            }
+        edges = mapping_store.edges_for(revision.id)
+        confirmed = [e.to_dict() for e in edges if e.confirmed]
+        unconfirmed = [e.to_dict() for e in edges if not e.confirmed]
+        graph = self.build_versioned_field_graph(revision.id)
+        return {
+            "ok": True,
+            "readable": True,
+            "semantic_id": semantic_id,
+            "revision": revision.to_dict(),
+            "is_published": revision.status == REV_PUBLISHED,
+            "confirmed_edges": confirmed,
+            "unconfirmed_edges": unconfirmed,
+            # 血缘图只含已确认边，未确认边被隔离
+            "graph": graph.to_adjacency(),
+            "message": f"当前可读取 {revision.version_tag} 版血缘（{len(confirmed)} 条已确认边）",
+        }
+
+    def read_report_field_chain(self, report_name: str) -> dict[str, Any]:
+        """报表字段链回查：沿报表固化的版次引用追溯，旧报表读到旧版血缘。"""
+        from app.services.semantic_revision import semantic_revision_service
+
+        lineage = semantic_revision_service.resolve_report_lineage(report_name)
+        if not lineage.get("ok"):
+            return lineage
+        chains: list[dict[str, Any]] = []
+        for binding in lineage["bindings"]:
+            revision_id = binding["report_ref"]["revision_id"]
+            graph = self.build_versioned_field_graph(revision_id)
+            for edge in binding["field_lineage"]:
+                if not edge["confirmed"]:
+                    continue
+                # 字段链：语义字段 → 物理列 → 源节点 → 目标节点
+                upstream = graph.upstream_chain(edge["target_node"])
+                chains.append({
+                    "report_name": report_name,
+                    "version_tag": binding["report_ref"]["version_tag"],
+                    "semantic_field": edge["semantic_field"],
+                    "physical_column": edge["physical_column"],
+                    "field_chain": f'{edge["target_node"]} ← {edge["source_node"]}.{edge["physical_column"]}（语义字段：{edge["semantic_field"]}）',
+                    "upstream_paths": upstream,
+                    "uses_current_published": binding["uses_current_published"],
+                })
+        return {
+            "ok": True,
+            "report_name": report_name,
+            "readable_version": sorted({c["version_tag"] for c in chains}),
+            "field_chains": chains,
+        }
+
+    def landing_readiness(self, revision_id: int) -> dict[str, Any]:
+        """核对版次落图就绪度：未确认边存在时血缘接口只能读到上一发布版。"""
+        from app.mapping_store import mapping_store
+
+        revision = mapping_store.get_revision(revision_id)
+        if revision is None:
+            return {"ok": False, "message": f"版次 {revision_id} 不存在"}
+        unconfirmed = [e.to_dict() for e in mapping_store.unconfirmed_edges(revision_id)]
+        published = mapping_store.published_revision(revision.semantic_id)
+        return {
+            "ok": True,
+            "revision": revision.to_dict(),
+            "unconfirmed_edges": unconfirmed,
+            "ready_to_publish": not unconfirmed,
+            "currently_readable_published": (
+                published.to_dict() if published else None
+            ),
+            "message": (
+                "全部边已确认，可发布切换"
+                if not unconfirmed
+                else f"{len(unconfirmed)} 条边未确认，血缘读取仍停留在 {published.version_tag if published else '无'}"
+            ),
+        }
+
     def domain_snapshot(self) -> dict[str, Any]:
         base = super().domain_snapshot()
         base["artifact"] = "数据血缘数据集"
         online = sum(1 for row in store.rows(self.MODULE) if row.get("status") == "在线")
         base["online_nodes"] = online
+        from app.mapping_store import mapping_store
+        base["mapping_revisions"] = len(mapping_store.revisions)
+        base["unconfirmed_lineage_edges"] = sum(
+            1 for edge in mapping_store.edges.values() if not edge.confirmed
+        )
+        base["landing_paused"] = mapping_store.landing_paused
         return base
